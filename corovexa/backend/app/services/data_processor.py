@@ -1,18 +1,26 @@
 """
 Data processor service for COROVEXA telemetry data.
-Loads and processes COROVEXA_cloud_dataset.csv using Pandas.
-Designed with a clean interface so the CSV source can be
-replaced by DynamoDB without rewriting the application.
+Loads telemetry from Amazon S3 via s3_service and processes it
+into a Pandas DataFrame for analysis.
+
+The internal DataFrame uses the same column names as the original CSV
+(thickness_mm, temperature_c, etc.) so that corrosion.py works unchanged.
+The CSV_TO_API_MAPPING dict translates internal names → API response names.
 """
 
-import os
-from pathlib import Path
+import logging
 from typing import Optional
 
 import pandas as pd
 
+from .s3_service import fetch_telemetry_records
 
-# Field name mapping: CSV columns -> API field names
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------
+# Field name mapping: internal column names → API field names
+# Kept identical to the original so every downstream consumer is unchanged.
+# -----------------------------------------------------------------------
 CSV_TO_API_MAPPING: dict[str, str] = {
     "timestamp": "timestamp",
     "node_id": "node_id",
@@ -23,19 +31,31 @@ CSV_TO_API_MAPPING: dict[str, str] = {
     "vibration_mps2": "vibration",
 }
 
+# S3 JSON field → internal DataFrame column name
+_S3_TO_INTERNAL: dict[str, str] = {
+    "node_id": "node_id",
+    "timestamp": "timestamp",
+    "thickness": "thickness_mm",
+    "temperature": "temperature_c",
+    "pressure": "air_pressure_hpa",
+    "moisture": "moisture_percent",
+    "vibration": "vibration_mps2",
+}
+
 # Nominal wall thickness for thinning calculations
-NOMINAL_THICKNESS_MM: float = 50.0
+NOMINAL_THICKNESS_MM: float = 105.0
 
 
 class DataProcessor:
-    """Service for loading and processing telemetry data from CSV.
+    """Service for loading and processing telemetry data from S3.
 
-    Singleton pattern ensures the CSV is loaded once and cached in memory.
-    Call reload() to refresh data if the CSV changes.
+    Singleton pattern ensures data is loaded once and cached in memory.
+    Call reload() to refresh data from S3.
     """
 
     _instance: Optional["DataProcessor"] = None
     _df: Optional[pd.DataFrame] = None
+    _node_metadata: dict = {}
 
     def __init__(self) -> None:
         self._load_data()
@@ -48,61 +68,63 @@ class DataProcessor:
         return cls._instance
 
     # ------------------------------------------------------------------
-    # Data Loading
+    # Data Loading — from S3
     # ------------------------------------------------------------------
 
-    def _get_csv_path(self) -> Path:
-        """Resolve the path to COROVEXA_cloud_dataset.csv."""
-        possible_paths = [
-            # Relative to backend/app/services/ -> ../../data/
-            Path(__file__).resolve().parent.parent.parent.parent / "data" / "COROVEXA_cloud_dataset.csv",
-            # Relative to backend/ -> ../data/
-            Path(__file__).resolve().parent.parent.parent / "data" / "COROVEXA_cloud_dataset.csv",
-            # Project root level (Corovexa-main/)
-            Path(__file__).resolve().parent.parent.parent.parent.parent / "COROVEXA_cloud_dataset.csv",
-        ]
-
-        # Environment variable override
-        env_path = os.environ.get("COROVEXA_CSV_PATH")
-        if env_path:
-            possible_paths.insert(0, Path(env_path))
-
-        for p in possible_paths:
-            if p is not None and p.exists():
-                return p
-
-        raise FileNotFoundError(
-            "COROVEXA_cloud_dataset.csv not found. "
-            "Expected in data/ directory or set COROVEXA_CSV_PATH env var. "
-            f"Searched: {[str(p) for p in possible_paths if p]}"
-        )
-
     def _load_data(self) -> None:
-        """Load and validate the CSV dataset."""
-        csv_path = self._get_csv_path()
-        self._df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+        """Fetch telemetry records from S3 and build the internal DataFrame."""
+        logger.info("Loading telemetry data from S3 …")
 
-        # Validate required columns exist
-        required_cols = set(CSV_TO_API_MAPPING.keys())
-        actual_cols = set(self._df.columns)
-        missing = required_cols - actual_cols
-        if missing:
-            raise ValueError(f"CSV missing required columns: {missing}")
+        raw_records = fetch_telemetry_records()
 
-        # Handle missing values
-        self._df = self._df.dropna(subset=["node_id", "timestamp"])
+        if not raw_records:
+            logger.warning("No telemetry records returned from S3 — DataFrame will be empty")
+            self._df = pd.DataFrame(columns=list(_S3_TO_INTERNAL.values()))
+            self._node_metadata = {}
+            return
 
-        # Ensure correct types
-        for col in ["thickness_mm", "temperature_c", "air_pressure_hpa",
-                     "moisture_percent", "vibration_mps2"]:
-            self._df[col] = pd.to_numeric(self._df[col], errors="coerce")
+        # Build DataFrame from list of dicts, then rename to internal columns
+        df = pd.DataFrame(raw_records)
+        df = df.rename(columns=_S3_TO_INTERNAL)
+
+        # Convert timestamp
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+
+        # Ensure correct numeric types
+        for col in [
+            "thickness_mm",
+            "temperature_c",
+            "air_pressure_hpa",
+            "moisture_percent",
+            "vibration_mps2",
+        ]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Drop rows with missing critical fields
+        df = df.dropna(subset=["node_id", "timestamp"])
 
         # Sort chronologically
-        self._df = self._df.sort_values("timestamp").reset_index(drop=True)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        self._df = df
+
+        # S3 JSON doesn't contain per-node metadata (PipeType, thresholds).
+        # corrosion.py already handles missing metadata with sensible defaults.
+        self._node_metadata = {}
+
+        logger.info(
+            "Loaded %d records for %d nodes from S3",
+            len(self._df),
+            self._df["node_id"].nunique(),
+        )
 
     def reload(self) -> None:
-        """Reload data from CSV (useful if dataset is updated)."""
+        """Reload data from S3 (useful to pick up newly published records)."""
         self._load_data()
+
+    def get_node_metadata(self, node_id: str) -> dict:
+        """Return the extracted metadata and thresholds for a given node."""
+        return self._node_metadata.get(node_id, {})
 
     @property
     def df(self) -> pd.DataFrame:
@@ -112,7 +134,7 @@ class DataProcessor:
         return self._df
 
     # ------------------------------------------------------------------
-    # Query Methods
+    # Query Methods  (unchanged from original)
     # ------------------------------------------------------------------
 
     def get_all_telemetry(self) -> list[dict]:
@@ -152,7 +174,7 @@ class DataProcessor:
         return result
 
     # ------------------------------------------------------------------
-    # Statistical Analysis
+    # Statistical Analysis  (unchanged from original)
     # ------------------------------------------------------------------
 
     def get_statistics(self) -> dict[str, dict]:

@@ -4,15 +4,39 @@ from fastapi import APIRouter, HTTPException, Depends
 from fastapi import status
 from ..models.schemas import TelemetryResponse, NodeTelemetryResponse
 from ..services.data_processor import DataProcessor
+from ..services.s3_service import check_s3_connection
 from ..api.deps import get_current_active_user, role_required
 
 router = APIRouter(prefix="/api/telemetry", tags=["Telemetry"])
 
 
+# ---------------------------------------------------------------------------
+# Health / connectivity check  (must be ABOVE /{node_id} to avoid clash)
+# ---------------------------------------------------------------------------
+
+@router.get("/health")
+def telemetry_health() -> dict:
+    """
+    Verify that FastAPI is running, S3 configuration exists,
+    and the S3 bucket can be reached.
+
+    Does NOT expose any credentials.
+    """
+    result = check_s3_connection()
+    status_code = 200 if result["status"] == "ok" else 503
+    if status_code != 200:
+        raise HTTPException(status_code=status_code, detail=result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Telemetry CRUD  (existing — unchanged)
+# ---------------------------------------------------------------------------
+
 @router.get("", dependencies=[Depends(get_current_active_user)])
 def get_all_telemetry() -> dict:
     """
-    Return all telemetry readings from the CSV dataset.
+    Return all telemetry readings fetched from S3.
     Fields are mapped to API names (thickness_mm -> thickness, etc.).
     """
     dp = DataProcessor.get_instance()

@@ -17,9 +17,8 @@ export default function MaintenanceLayout() {
     <div className="d-flex vh-100 bg-light overflow-hidden">
       {/* Sidebar - Hidden on mobile, offcanvas style for field workers */}
       <div className="d-none d-md-flex flex-column bg-white border-end" style={{ width: '260px' }}>
-        <div className="p-4 border-bottom d-flex align-items-center gap-2">
-          <Activity size={24} className="text-primary" />
-          <span className="fs-5 fw-bold tracking-wider">COROVEXA</span>
+        <div className="p-4 border-bottom d-flex align-items-center justify-content-center">
+          <img src="/logo.png" alt="COROVEXA Logo" style={{ height: '45px', objectFit: 'contain' }} />
         </div>
         
         <div className="p-3">

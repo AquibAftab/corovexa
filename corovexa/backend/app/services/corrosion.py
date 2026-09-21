@@ -11,70 +11,87 @@ from .data_processor import DataProcessor, NOMINAL_THICKNESS_MM
 
 # Location mapping for known sensor nodes
 NODE_LOCATIONS: dict[str, str] = {
-    "NODE_01": "Blast Furnace Feed",
+    "N01": "Blast Furnace Feed",
+    "N02": "Cooling Tower Loop",
+    "N03": "Steam Distribution Header",
+    "N04": "Chemical Processing Line",
 }
 
-# Sensor metric definitions used to build the pipeline -> sensors view.
-# For thickness we present "Wall Thinning" (nominal - current) so the
-# gauge color bands (higher = worse) render correctly.
-SENSOR_DEFINITIONS: list[dict] = [
-    {
-        "suffix": "THK",
-        "metric": "Wall Thinning",
-        "csv_col": "thickness_mm",
-        "unit": "mm",
-        "invert": True,       # value = NOMINAL - raw
-        "warningMax": 0.5,    # 0.5 mm loss
-        "criticalMax": 1.0,   # 1.0 mm loss
-    },
-    {
-        "suffix": "TMP",
-        "metric": "Temperature",
-        "csv_col": "temperature_c",
-        "unit": "\u00b0C",
-        "invert": False,
-        "warningMax": 65.0,
-        "criticalMax": 67.0,
-    },
-    {
-        "suffix": "PRS",
-        "metric": "Pressure",
-        "csv_col": "air_pressure_hpa",
-        "unit": "hPa",
-        "invert": False,
-        "warningMax": 1014.0,
-        "criticalMax": 1015.0,
-    },
-    {
-        "suffix": "MST",
-        "metric": "Moisture",
-        "csv_col": "moisture_percent",
-        "unit": "%",
-        "invert": False,
-        "warningMax": 48.0,
-        "criticalMax": 53.0,
-    },
-    {
-        "suffix": "VIB",
-        "metric": "Vibration",
-        "csv_col": "vibration_mps2",
-        "unit": "m/s\u00b2",
-        "invert": False,
-        "warningMax": 0.35,
-        "criticalMax": 0.45,
-    },
-]
+# We will dynamically generate SENSOR_DEFINITIONS per node using get_sensor_definitions_for_node
 
 
 def get_node_location(node_id: str) -> str:
     """Return the physical location for a node ID."""
     return NODE_LOCATIONS.get(node_id, f"Sector {node_id}")
 
+def get_sensor_definitions_for_node(node_id: str, dp: DataProcessor) -> list[dict]:
+    """Dynamically construct sensor definitions and thresholds based on parsed metadata."""
+    meta = dp.get_node_metadata(node_id)
+    
+    # Defaults in case metadata is missing
+    thk_w = meta.get("Thickness Warning") or (NOMINAL_THICKNESS_MM - 5.0)
+    thk_c = meta.get("Thickness Critical") or (NOMINAL_THICKNESS_MM - 10.0)
+    
+    tmp_c = meta.get("Temperature") or 100.0
+    vib_c = meta.get("Vibration") or 1.0
+    mst_c = meta.get("Moisture") or 60.0
+    prs_c = meta.get("Pressure") or 1000.0
+
+    return [
+        {
+            "suffix": "THK",
+            "metric": "Wall Thinning",
+            "csv_col": "thickness_mm",
+            "unit": "mm",
+            "invert": True,  # value = NOMINAL - raw
+            "nominal": NOMINAL_THICKNESS_MM,
+            "warningMax": round(NOMINAL_THICKNESS_MM - thk_w, 2),
+            "criticalMax": round(NOMINAL_THICKNESS_MM - thk_c, 2),
+        },
+        {
+            "suffix": "TMP",
+            "metric": "Temperature",
+            "csv_col": "temperature_c",
+            "unit": "\u00b0C",
+            "invert": False,
+            "warningMax": round(tmp_c * 0.9, 2),
+            "criticalMax": float(tmp_c),
+        },
+        {
+            "suffix": "PRS",
+            "metric": "Pressure Drop",
+            "csv_col": "air_pressure_hpa",
+            "unit": "hPa",
+            "invert": True, # Pressure drops are bad (< 1005). So we invert to measure "Drop"
+            "nominal": 1025.0, # Assumed nominal high pressure
+            "warningMax": round(1025.0 - (prs_c + 5.0), 2),
+            "criticalMax": round(1025.0 - prs_c, 2),
+        },
+        {
+            "suffix": "MST",
+            "metric": "Moisture",
+            "csv_col": "moisture_percent",
+            "unit": "%",
+            "invert": False,
+            "warningMax": round(mst_c * 0.9, 2),
+            "criticalMax": float(mst_c),
+        },
+        {
+            "suffix": "VIB",
+            "metric": "Vibration",
+            "csv_col": "vibration_mps2",
+            "unit": "m/s\u00b2",
+            "invert": False,
+            "warningMax": round(vib_c * 0.8, 2),
+            "criticalMax": float(vib_c),
+        },
+    ]
+
 
 def _transform_value(raw: float, sensor_def: dict) -> float:
-    """Apply value transformation (e.g. wall thinning inversion)."""
+    """Apply value transformation (e.g. wall thinning or pressure drop inversion)."""
     if sensor_def["invert"]:
-        return round(NOMINAL_THICKNESS_MM - raw, 2)
+        return round(sensor_def["nominal"] - raw, 2)
     return round(raw, 2)
 
 
@@ -106,7 +123,9 @@ def build_pipeline_data(data_processor: Optional[DataProcessor] = None) -> list[
         has_critical = False
         has_warning = False
 
-        for sdef in SENSOR_DEFINITIONS:
+        sensor_defs = get_sensor_definitions_for_node(node_id, dp)
+
+        for sdef in sensor_defs:
             raw_value = float(latest[sdef["csv_col"]])
             display_value = _transform_value(raw_value, sdef)
             status = _evaluate_status(display_value, sdef["warningMax"], sdef["criticalMax"])
@@ -158,8 +177,10 @@ def evaluate_alerts(data_processor: Optional[DataProcessor] = None) -> list[dict
         node_data = dp.df[dp.df["node_id"] == node_id]
         latest = node_data.sort_values("timestamp").iloc[-1]
         timestamp = str(latest["timestamp"])
+        
+        sensor_defs = get_sensor_definitions_for_node(node_id, dp)
 
-        for sdef in SENSOR_DEFINITIONS:
+        for sdef in sensor_defs:
             raw_value = float(latest[sdef["csv_col"]])
             display_value = _transform_value(raw_value, sdef)
             status = _evaluate_status(display_value, sdef["warningMax"], sdef["criticalMax"])

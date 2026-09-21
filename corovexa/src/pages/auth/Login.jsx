@@ -46,10 +46,7 @@ export default function Login() {
       <div className="card bg-white text-dark shadow border-0" style={{ width: '100%', maxWidth: '450px' }}>
         
         <div className="card-header bg-white text-center border-bottom py-4">
-          <div className="d-inline-flex align-items-center justify-content-center bg-light rounded-circle mb-3" style={{ width: '64px', height: '64px' }}>
-            <Activity size={32} className="text-primary" />
-          </div>
-          <h2 className="mb-1 tracking-wider fw-bold">COROVEXA</h2>
+          <img src="/logo.png" alt="COROVEXA Logo" style={{ width: '250px', height: 'auto', marginBottom: '1rem' }} />
           <p className="text-muted small mb-0">Steel Plant Health & Predictive Maintenance</p>
         </div>
 
